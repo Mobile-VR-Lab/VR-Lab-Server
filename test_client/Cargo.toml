@@ -1,0 +1,13 @@
+[package]
+name = "test_client"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.79"
+serde = { version = "1.0.196", features = ["serde_derive"] }
+serde_json = "1.0.113"
+socket2 = { version = "0.5.5", features = ["all"] }
+uuid = { version = "1.7.0", features = ["v4"] }
