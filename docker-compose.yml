@@ -1,0 +1,12 @@
+
+version: "3.8"
+services:
+  vr-lab-server:
+    ports:
+      - "8080:8080"   # API Server
+      - "15300:15300" # HCP Server
+    build:
+      context: .
+      dockerfile: Dockerfile
+#  healthcheck: <-- Worth implementing this later.
+
