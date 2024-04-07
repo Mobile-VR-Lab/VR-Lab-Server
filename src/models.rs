@@ -20,7 +20,7 @@ impl From<MessageVariant> for Message {
             // The discriminant is like an unnamed usize field at the start of the associated struct.
             id: unsafe { *(&value as *const MessageVariant as *const usize) },
             kwargs: value
-        }    
+        }
     }
 }
 
@@ -38,6 +38,12 @@ pub enum MessageVariant {
     FocusOnObject {
         object: String,
     } = 0x2,
+    SetAttentionMode {
+        attention: bool,
+    } = 0x3,
+    SetTransparencyMode {
+        transparency: bool,
+    } = 0x4,
     #[serde(skip_deserializing)]
     Query {} = 0x0,
 }
@@ -172,10 +178,14 @@ mod test {
         let query: Message = MessageVariant::Query {}.into();
         let scene_change: Message = MessageVariant::ChangeScene { scene: 1 }.into();
         let object_focus: Message = MessageVariant::FocusOnObject { object: "object".to_owned() }.into();
+        let attn: Message = MessageVariant::SetAttentionMode { attention: true }.into();
+        let trans: Message = MessageVariant::SetTransparencyMode { transparency: true }.into();
 
         assert!(query.id == 0);
         assert!(scene_change.id == 1);
         assert!(object_focus.id == 2);
+        assert!(attn.id == 3);
+        assert!(trans.id == 4);
     }
 
     #[test]
