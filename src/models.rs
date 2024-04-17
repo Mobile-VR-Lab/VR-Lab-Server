@@ -1,6 +1,10 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
+use quanta::Instant;
 use serde_derive::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+
+use crate::AsyncHandle;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
@@ -75,23 +79,85 @@ pub enum ResponseType {
     Query { /* ... */ }
 }
 
+/*
+A representation of a headset's connection health.
+*/
+#[derive(Serialize)]
+pub enum ConnectionHealth {
+    Excellent,
+    Good,
+    Poor,
+    Unknown
+}
+
+/*
+Less than 50 millis means excellent, less than 200 millis means good, and worse than that is poor.
+*/
+impl ConnectionHealth {
+    pub fn from_times<'t>(count: usize, times: impl Iterator<Item = (&'t quanta::Instant, &'t quanta::Instant)>) -> ConnectionHealth {
+        if count == 0 {
+            return Self::Unknown;
+        }
+        
+        let mean_latency = times.take(count.max(10)).map(|(sen, rec)| (*rec - *sen).as_millis()).sum::<u128>() as usize / count;
+
+        if mean_latency < 50 {
+            Self::Excellent
+        } else if mean_latency < 200 {
+            Self::Good
+        } else {
+            Self::Poor
+        }
+    }
+}
+
 // Represents the observed state of the headset.
 // If we want more data from the headset, it should be stored here.
-#[derive(Serialize, Deserialize)]
 pub struct HeadsetState {
     pub name: String,
     pub recv: usize,
-    #[serde(skip)] // Let's omit this field when we sent headsets to the tablet.
+    //#[serde(skip)] // Let's omit this field when we sent headsets to the tablet.
     responses: Vec<Response>,
+    //#[serde(skip)]
+    recv_times: Vec<Instant>,
+    //#[serde(skip)]
+    send_times: Vec<Instant>,
 }
 
 impl HeadsetState {
+    pub fn new(hid: String) -> AsyncHandle<Self> {
+        Arc::new(RwLock::new(HeadsetState {
+            name: hid,
+            recv: 0,
+            responses: Vec::new(),
+            recv_times: Vec::new(),
+            send_times: Vec::new(),
+        }))
+    }
+
     pub fn push_response(&mut self, r: Response) {
         self.responses.push(r);
     }
 
-    pub fn responses(&self) -> &Vec<Response> {
-        &self.responses
+    pub fn push_recv_time(&mut self, time: quanta::Instant) {
+        self.recv_times.push(time);
+    }
+
+    pub fn push_send_time(&mut self, time: quanta::Instant) {
+        self.send_times.push(time);
+    }
+
+    pub fn connection_health(&self) -> ConnectionHealth {
+        let recv_times = self.recv_times.iter();
+        let send_times = self.send_times.iter();
+        let recv_len = self.recv_times.len();
+        let send_len = self.send_times.len();
+
+        if recv_len < send_len {
+            ConnectionHealth::from_times(recv_len, send_times.zip(recv_times.skip(send_len - recv_len)))
+        } else {
+            ConnectionHealth::from_times(recv_len, send_times.zip(recv_times))
+        }
     }
 }
 
@@ -101,7 +167,7 @@ Represents the state of the server. It keeps track of:
  - Messages ordered to be sent by the server.
 */
 pub struct ServerState {
-    headsets: HashMap<String, HeadsetState>,
+    headsets: HashMap<String, AsyncHandle<HeadsetState>>,
     messages: Vec<Message>,
 }
 
@@ -119,45 +185,17 @@ impl ServerState {
         &self.messages
     }
 
-    pub fn headset(&self, id: &str) -> Option<&HeadsetState> {
-        self.headsets.get(id)
-    }
-
-    pub fn headset_mut(&mut self, id: &str) -> Option<&mut HeadsetState> {
-        self.headsets.get_mut(id)
-    }
-
     pub fn drop_headset(&mut self, id: &str) {
         self.headsets.remove(id);
     }
-
-    pub fn headsets(&self) -> &HashMap<String, HeadsetState> {
-        &self.headsets
-    }
     
-    pub fn headset_iter(&self) -> impl Iterator<Item=(&str, &HeadsetState)> {
+    pub fn headset_iter(&self) -> impl Iterator<Item=(&str, &AsyncHandle<HeadsetState>)> {
         self.headsets.iter()
             .map(|(stref, hs)| (stref.as_str(), hs))
     }
 
-    pub fn push_headset(&mut self, id: String, session_name: String) {
-        self.headsets.insert(id, HeadsetState {
-            name: session_name,
-            recv: 0,
-            responses: Vec::new(),
-        });
-    }
-
-    pub async fn num_headsets_waiting(&mut self) -> usize {
-        let mut count = 0;
-
-        for headset in self.headsets.values() {
-            if headset.recv == self.messages.len() {
-                count += 1;
-            }
-        }
-
-        return count;
+    pub fn push_headset(&mut self, id: String, hset: AsyncHandle<HeadsetState>) {
+        self.headsets.insert(id, hset);
     }
 
     /*

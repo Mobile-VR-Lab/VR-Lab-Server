@@ -1,8 +1,36 @@
 
+use std::{collections::HashMap, net::SocketAddr};
+
 use poem::{error::InternalServerError, get, http::{Method, StatusCode}, listener::TcpListener, post, Endpoint, Request, Response, Route, Server};
+use serde::Serialize;
 use tokio::task::JoinHandle;
 
-use crate::{models::{Message, MessageVariant, ServerState}, server::VRLabServer, AsyncHandle};
+use crate::{models::{ConnectionHealth, Message, MessageVariant, ServerState}, server::VRLabServer, AsyncHandle};
+
+#[derive(Serialize)]
+struct HeadsetInfo {
+    name: String,
+    recv: usize,
+    connection_health: ConnectionHealth,
+}
+
+impl HeadsetInfo {
+    pub async fn collect_from_state(state: &ServerState) -> HashMap<String, HeadsetInfo> {
+        let mut infos = HashMap::new();
+
+        for (id, headset) in state.headset_iter() {
+            let rh = headset.read().await;
+            
+            infos.insert(id.to_owned(), HeadsetInfo {
+                name: rh.name.clone(),
+                recv: rh.recv,
+                connection_health: rh.connection_health(),
+            });
+        }
+
+        infos
+    }
+}
 
 /*
 Endpoint to read the headsets connected.
@@ -17,7 +45,8 @@ impl Endpoint for HeadsetsEndpoint {
         if req.method() == Method::GET {
             let body = {
                 let state = self.0.read().await;
-                serde_json::to_string_pretty(state.headsets()).map_err(InternalServerError)?
+                let headset_info = HeadsetInfo::collect_from_state(&state).await;
+                serde_json::to_string_pretty(&headset_info).map_err(InternalServerError)?
             };
 
             Ok(Response::builder()
@@ -70,6 +99,8 @@ impl Endpoint for PostCommandEndpoint {
             .into_json::<MessageVariant>().await?
             .into();
 
+        log::debug!("Recv message with id: {}", msg.id());
+
         if msg_type == msg.id() {
             if let Err(why) = server.broadcast(msg).await {
                 Ok(Response::builder()
@@ -92,7 +123,7 @@ impl Endpoint for PostCommandEndpoint {
 }
 
 // Start up the web server.
-pub async fn init_api(vrlab_server: AsyncHandle<VRLabServer>) -> JoinHandle<Result<(), std::io::Error>> {
+pub async fn init_api(addr: &str, vrlab_server: AsyncHandle<VRLabServer>) -> JoinHandle<Result<(), std::io::Error>> {
     let state = vrlab_server.read().await.get_state_handle();
 
     let api = Route::new()
@@ -100,7 +131,10 @@ pub async fn init_api(vrlab_server: AsyncHandle<VRLabServer>) -> JoinHandle<Resu
         .at("/commands", get(GetCommandsEndpoint(state.clone())))
         .at("/command/:type", post(PostCommandEndpoint(vrlab_server.clone())));
 
-    let server = Server::new(TcpListener::bind("0.0.0.0:8080"))
+    let addr: SocketAddr = addr.parse()
+        .expect("Invalid socket address provided for the web API");
+
+    let server = Server::new(TcpListener::bind(addr))
         .name("vr-lab-api");
 
     // Spawn the web server in a separate task executor.
