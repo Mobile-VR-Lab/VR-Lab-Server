@@ -52,20 +52,6 @@ pub enum MessageVariant {
     Query {} = 0x0,
 }
 
-// /*
-// Response wrapper which represents the status.
-// NotReceived is a placeholder variant which could be used.
-// Received means the value has actually come in on the wire.
-// Terminated means the connection has been terminated, and no more responses will be received (a signal that the rx thread is dead).
-// */
-// #[derive(Serialize, Deserialize, Debug)]
-// #[serde(untagged)]
-// pub enum Response {
-//     Received(RawResponse),
-//     NotReceived,
-//     Terminated,
-// }
-
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Response {
     pub error: bool,
@@ -87,7 +73,7 @@ pub enum ConnectionHealth {
     Excellent,
     Good,
     Poor,
-    Unknown
+    //Unknown
 }
 
 /*
@@ -96,10 +82,14 @@ Less than 50 millis means excellent, less than 200 millis means good, and worse 
 impl ConnectionHealth {
     pub fn from_times<'t>(count: usize, times: impl Iterator<Item = (&'t quanta::Instant, &'t quanta::Instant)>) -> ConnectionHealth {
         if count == 0 {
-            return Self::Unknown;
+            return Self::Excellent;
         }
+
+        let taken = count.min(10);
         
-        let mean_latency = times.take(count.max(10)).map(|(sen, rec)| (*rec - *sen).as_millis()).sum::<u128>() as usize / count;
+        let mean_latency = times.take(taken).map(|(sen, rec)| (*rec - *sen).as_millis()).sum::<u128>() as usize / taken;
+
+        log::debug!("Headset mean latency: {}", mean_latency);
 
         if mean_latency < 50 {
             Self::Excellent
@@ -154,7 +144,7 @@ impl HeadsetState {
         let send_len = self.send_times.len();
 
         if recv_len < send_len {
-            ConnectionHealth::from_times(recv_len, send_times.zip(recv_times.skip(send_len - recv_len)))
+            ConnectionHealth::from_times(recv_len, send_times.skip(send_len - recv_len).zip(recv_times))
         } else {
             ConnectionHealth::from_times(recv_len, send_times.zip(recv_times))
         }

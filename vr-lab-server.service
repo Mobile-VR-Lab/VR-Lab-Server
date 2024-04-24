@@ -1,0 +1,14 @@
+[Unit]
+Description=VR Lab Server
+After=networking.target
+
+[Service]
+Type=simple
+User=root
+Environment="RUST_LOG=info"
+ExecStart=/root/.cargo/bin/vr-lab-server
+Restart=always
+
+[Install]
+WantedBy=network-online.target
+

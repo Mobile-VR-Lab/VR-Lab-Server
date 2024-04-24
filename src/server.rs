@@ -1,5 +1,5 @@
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, os::linux::raw::stat, sync::Arc, time::Duration};
 use anyhow::anyhow;
 use futures::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
@@ -114,6 +114,7 @@ impl VRClient {
                             let mut wh = headset_state.write().await;
                             wh.push_response(resp);
                             wh.push_recv_time(recv_time);
+                            wh.recv += 1;
                         }
                         Err(why) | Ok(Err(why)) => {
                             log::error!("Got bad JSON from a headset. Serialization failed. Reason: {}", why);
@@ -123,6 +124,19 @@ impl VRClient {
                 }
             }
         }
+    }
+
+    async fn do_retransmissions(client: VRClient, state: AsyncHandle<ServerState>) -> anyhow::Result<VRClient> {
+        /*
+        Collect relevant messages and retransmit them to a connecting client.
+        */
+        let state = state.read().await;
+
+        if let Some(msg) = state.messages().iter().filter(|msg| msg.id() == 1).last() {
+            client.mtx().send_timeout(msg.to_owned(), Duration::from_secs(5)).await?;
+        }
+
+        Ok(client)
     }
 
     /*
@@ -152,6 +166,7 @@ impl VRClient {
         let (hid, session_name) = ident.unwrap();
         let headset_state = HeadsetState::new(session_name.clone());
         let headset_state_2 = headset_state.clone();
+        let state_2 = state.clone();
 
         {
             let mut wh = state.write().await;
@@ -174,9 +189,11 @@ impl VRClient {
             wrl.drop_headset(hid.as_str());
         });
 
-        Ok(VRClient {
+        let vrc = VRClient {
             mtx
-        })
+        };
+
+        Self::do_retransmissions(vrc, state_2).await
     }
 
     fn mtx(&self) -> &Sender<Message> {
