@@ -138,8 +138,8 @@ impl HeadsetState {
     }
 
     pub fn connection_health(&self) -> ConnectionHealth {
-        let recv_times = self.recv_times.iter();
-        let send_times = self.send_times.iter();
+        let recv_times = self.recv_times.iter().rev();
+        let send_times = self.send_times.iter().rev();
         let recv_len = self.recv_times.len();
         let send_len = self.send_times.len();
 
