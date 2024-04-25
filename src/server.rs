@@ -1,16 +1,17 @@
 
-use std::{collections::HashMap, net::SocketAddr, os::linux::raw::stat, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use anyhow::anyhow;
 use futures::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use quanta::Clock;
 use serde_derive::{Deserialize, Serialize};
-use tokio::{net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpListener, TcpStream}, sync::{mpsc::{channel, Receiver, Sender}, Mutex, RwLock}, task::JoinHandle};
+use tokio::{net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpListener, TcpStream}, sync::{mpsc::{channel, Receiver, Sender}, RwLock}, task::JoinHandle};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use crate::{models::{HeadsetState, Message, Response, ServerState}, AsyncHandle};
 
 struct VRClient {
     mtx: Sender<Message>,
+    closed: Arc<RwLock<bool>>,
 }
 
 impl VRClient {
@@ -20,25 +21,48 @@ impl VRClient {
     async fn initiate_connection(rx: &mut FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
         tx: &mut FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>) -> Option<(String, String)> {
 
+        log::debug!("Starting initial connection handshake, first sending protocol version...");
+
         // Send version struct.
-        tx.send(serde_json::to_string(&VRLabServer::VERSION).unwrap().into()).await
-        .expect("Failed to send initial version msg");
+        if let Err(why) = tx.send(serde_json::to_string(&VRLabServer::VERSION).unwrap().into()).await {
+            log::error!("Failed to send the protocol version to the headset: {}", why)
+        };
 
         // Get the headset ID.
-        let headset_id = rx.next().await
+        let hset_id_bytes = rx.next().await
         .map(|x| {
-            x.ok()
+            x.inspect_err(|why| {
+                log::error!("Headset failed to respond with its ID: {}", why)
+            }).ok()
         })
-        .flatten()
-        .map(|x| {
-            String::from_utf8(x.into()).ok()
+        .flatten();
+
+        if hset_id_bytes.is_none() {
+            log::error!("Headset closed the connection unexpectedly instead of replying with its ID");
+        }
+
+        let headset_id = hset_id_bytes.map(|x| {
+            String::from_utf8(x.into())
+            .inspect_err(|why| {
+                log::error!("Encountered decode error on headset ID response. Is it valid UTF-8? Reason: {}", why)
+            })
+            .ok()
             .and_then(|str| {
                 serde_json::from_str::<HeadsetIdResponse>(str.as_str())
                 .map(|response| response.id)
+                .inspect_err(|why| {
+                    log::error!("Failed to serialize headset ID response: {}", why)
+                })
                 .ok()
             })
         })
         .flatten();
+
+        if headset_id.is_none() {
+            log::error!("Headset did not successfully reply with an ID.");
+        } else {
+            log::debug!("Received the headset's ID...")
+        }
 
         // Gen a new random session name.
         let session_name = SessionName::get_new_name().await;
@@ -46,7 +70,11 @@ impl VRClient {
         // Send to the client to use for display.
         tx.send(
             serde_json::to_string(&session_name).unwrap().into()
-        ).await.ok()
+        ).await
+        .inspect_err(|why| {
+            log::error!("Failed to transmit session name back to headset: {}", why)
+        })
+        .ok()
         .and_then( // Return a tuple of the headset ID and the session name.
             |_| headset_id.map(|hid| (hid, session_name.session_name))
         )
@@ -74,7 +102,7 @@ impl VRClient {
                     break 'net;
                 }
             } else {
-                message_tx.close().await.expect("Channel to shut down");
+                log::debug!("Producer thread terminated because the stream ended");
                 break 'net;
             }
         }
@@ -160,6 +188,8 @@ impl VRClient {
 
         if ident.is_none() {
             return Err(anyhow!("Failed to complete the initial handshake"));
+        } else {
+            log::debug!("Headset has completed the initial handshake.");
         }
 
         // This is 100% safe past this point.
@@ -177,20 +207,32 @@ impl VRClient {
         Spawn new threads to handle the connection.
         */
 
+        // Allocate closed flag.
+        let closed = Arc::new(RwLock::new(false));
+        
+        // Copies for the read and write threads.
+        let csl = closed.clone();
+        let crl = closed.clone();
+
         tokio::spawn(async move {
             Self::send_loop(message_tx, mrx, headset_state_2).await;
+
+            *(csl.write().await) = true;
         });
 
         tokio::spawn(async move {
             Self::recv_loop(response_rx, headset_state).await;
             
+            *(crl.write().await) = true;
+
             // Tidy up and drop headset once done.
             let mut wrl = state.write().await;
             wrl.drop_headset(hid.as_str());
         });
 
         let vrc = VRClient {
-            mtx
+            mtx,
+            closed
         };
 
         Self::do_retransmissions(vrc, state_2).await
@@ -198,6 +240,10 @@ impl VRClient {
 
     fn mtx(&self) -> &Sender<Message> {
         &self.mtx
+    }
+
+    pub async fn is_closed(&self) -> bool {
+        *self.closed.read().await
     }
 }
 
@@ -273,13 +319,13 @@ impl VRLabServer {
         for (origin, sender) in self.connections.iter() {
             let result = sender.mtx().send_timeout(message.clone(), Duration::from_secs(5)).await;
             
-            match result {
-                Err(_) => dead_connections.push(origin.to_owned()),
-                _ => {},
+            if sender.is_closed().await || result.is_err() {
+                dead_connections.push(origin.to_owned())
             }
         }
 
         for d in dead_connections {
+            log::debug!("Cleaning up connection to {}", d);
             self.connections.remove(&d);
         }
 
